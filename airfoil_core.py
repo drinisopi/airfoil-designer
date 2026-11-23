@@ -17,6 +17,7 @@ wing, section CL = wing CL, induced drag with Oswald e = 0.85 (only for range/en
 2-D airfoil data from NeuralFoil (the same solver that produced the training labels).
 """
 import pickle
+import threading
 import warnings
 from math import comb
 
@@ -28,6 +29,7 @@ RE_MIN, RE_MAX = 5e4, 5e5            # range the model has seen
 CM_MIN, T_MAX = -0.12, 0.22
 GATE_CONF, GATE_ERR = 0.7, 5.0       # NeuralFoil confidence >= 0.7, surrogate error <= 5 %
 STALL_DESIGN, STALL_OFF = 1.3, 1.05  # CLmax / CL_req margins
+CACHE_MAX = 8                         # max. remembered reference results (oldest removed first)
 EFFORT = {                            # search effort presets
     "fast": dict(al=21, clg=12, maxiter=40, popsize=10),
     "full": dict(al=41, clg=25, maxiter=100, popsize=15),
@@ -104,7 +106,10 @@ class Core:
         self.nets = [[(wz[f"n{i}_W{j}"], wz[f"n{i}_b{j}"]) for j in range(4)] for i in range(n_nets)]
         self.W_real = self.z_to_w(self.Z)                                 # (n, 12)
         self.thick_real = np.array([thickness(w) for w in self.W_real])
+        # Reference results per drone/mission. One Core is shared by all app visitors, so the
+        # cache is kept small (CACHE_MAX entries) and guarded by a lock for concurrent sessions.
         self._cache = {}
+        self._cache_lock = threading.Lock()
 
     # --- latent space
     def z_to_w(self, z):
@@ -202,8 +207,10 @@ class Core:
     def _reference(self, D, mission, t_min, effort):
         key = (mission, round(t_min, 4), effort, tuple(round(float(D[k]), 6) for k in ("m", "S", "c", "AR")),
                round(float(D.get("V", 0)), 6))
-        if key in self._cache:
-            return self._cache[key]
+        with self._cache_lock:
+            if key in self._cache:
+                return self._cache[key]
+        # The (slow) computation below runs outside the lock, so other visitors are not blocked.
         AL, CLG = _grid(effort)
         n = len(self.Z)
         if mission == "cruise":
@@ -235,7 +242,10 @@ class Core:
                 raise ValueError("No feasible airfoil for this drone (Reynolds number out of the "
                                  "5e4-5e5 range or stall margin not reachable).")
             ref_data = dict(ref=float(np.nanmax(mets)), pts=None, short=[int(np.nanargmax(mets))])
-        self._cache[key] = ref_data
+        with self._cache_lock:
+            self._cache[key] = ref_data
+            while len(self._cache) > CACHE_MAX:              # dicts keep insertion order:
+                self._cache.pop(next(iter(self._cache)))     # drop the oldest entry
         return ref_data
 
     def _make_score(self, D, mission, t_min, cap, effort, ref_data):

@@ -10,6 +10,8 @@ All the engineering logic lives in airfoil_core.py. This file only:
   2. calls Core.run(),
   3. shows the result honestly (plot, gate verdict, operating point, .dat download).
 """
+import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -27,6 +29,13 @@ DEFAULT_MASS = 2.0     # kg
 DEFAULT_SPAN = 2.0     # m
 DEFAULT_CHORD = 0.2    # m
 DEFAULT_SPEED = 14.0   # m/s (only used for the cruise mission)
+
+# Typical run time on Streamlit Community Cloud (free tier), measured. Shown to the user.
+RUN_TIME_TEXT = {"cruise": "about 20 s", "range": "about 2 min", "endurance": "about 2 min"}
+
+# Colors used in both plots (same meaning everywhere).
+COLOR_OPT = "#1f6fb4"      # optimized airfoil
+COLOR_CLASSIC = "0.55"     # best classic airfoil (gray)
 
 MISSION_HELP = {
     "cruise": "Minimum drag at your chosen speed (also checked at -20 % and +20 % of that speed).",
@@ -61,19 +70,90 @@ def plot_airfoils(result, core):
     fig, ax = plt.subplots(figsize=(9, 2.8))
     classic_xy = classic_outline(core, result["classic_name"])
     if result["passed"]:
-        ax.plot(classic_xy[:, 0], classic_xy[:, 1], color="0.55", lw=1.5, ls="--",
+        ax.plot(classic_xy[:, 0], classic_xy[:, 1], color=COLOR_CLASSIC, lw=1.5, ls="--",
                 label=f"best classic: {result['classic_name']}")
         xy = result["outline"]
-        ax.plot(xy[:, 0], xy[:, 1], color="#1f6fb4", lw=2.2, label="optimized")
+        ax.plot(xy[:, 0], xy[:, 1], color=COLOR_OPT, lw=2.2, label="optimized")
     else:
-        ax.plot(classic_xy[:, 0], classic_xy[:, 1], color="#1f6fb4", lw=2.2,
+        ax.plot(classic_xy[:, 0], classic_xy[:, 1], color=COLOR_OPT, lw=2.2,
                 label=f"best classic: {result['classic_name']} (recommended)")
-    ax.set_aspect("equal")
-    ax.set_xlabel("x / c")
-    ax.set_ylabel("y / c")
+    ax.set_aspect("equal")                 # same scale on x and y: the shape is not distorted
+    ax.set_xlabel("x / c", fontsize=9)
+    ax.set_ylabel("y / c", fontsize=9)
+    ax.tick_params(labelsize=8)
     ax.grid(alpha=0.3)
-    ax.legend(loc="upper right", fontsize=9)
+    # Legend OUTSIDE the axes, just above the top edge, so it never covers the airfoil.
+    # Streamlit saves the figure with bbox_inches="tight", so the legend is not cut off.
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=2, fontsize=9, frameon=False)
     fig.tight_layout()
+    return fig
+
+
+def plot_difference(result, core, D, mission):
+    """Second plot, only for a verified (gate passed) result:
+    left  = shape difference y_optimized - y_classic along the chord (upper and lower surface),
+    right = the NeuralFoil numbers the gate compared (no new calculations, only verification rows)."""
+    rows = result["verification"]["rows"]
+    opt_rows = [r for r in rows if r["who"] == "optimized"]
+    cls_rows = [r for r in rows if r["who"] == "classic"]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 3.0), layout="constrained",
+                                   gridspec_kw=dict(width_ratios=[1.6, 1]))
+
+    # --- left: shape difference. Both outlines use the same 201 x-points (Selig order:
+    # points 0..100 = upper surface from TE to LE, points 100..200 = lower surface LE to TE),
+    # so we can subtract the y values point by point.
+    xy_o = result["outline"]
+    xy_c = classic_outline(core, result["classic_name"])
+    dy = 100 * (xy_o[:, 1] - xy_c[:, 1])             # in % of chord
+    ax1.axhline(0, color="0.3", lw=0.8)
+    ax1.plot(xy_o[:101, 0], dy[:101], color=COLOR_OPT, lw=2, label="upper surface")
+    ax1.plot(xy_o[100:, 0], dy[100:], color=COLOR_OPT, lw=2, ls=":", label="lower surface")
+    ax1.set_xlabel("x / c", fontsize=9)
+    ax1.set_ylabel("y optimized - y classic\n(% of chord)", fontsize=9)
+    ax1.set_title("Shape difference", fontsize=10)
+    ax1.tick_params(labelsize=8)
+    ax1.grid(alpha=0.3)
+    ax1.legend(fontsize=8, frameon=False)
+
+    # --- right: what the gate measured with NeuralFoil
+    if mission == "cruise":
+        # Rows are in the order of Core.cruise_points: design speed, -20 %, +20 %.
+        # Re-order to slow -> fast so the bars read left to right.
+        order = [1, 0, 2]
+        labels = [f"{D['V'] * f:.1f} m/s" for f in (0.8, 1.0, 1.2)]
+        vals_c = [cls_rows[i]["CD_nf"] for i in order]
+        vals_o = [opt_rows[i]["CD_nf"] for i in order]
+        vals_c = [None if v is None else v * 1e4 for v in vals_c]   # drag counts (CD x 10^4)
+        vals_o = [None if v is None else v * 1e4 for v in vals_o]
+        ylabel, title, fmt_spec = "section CD x 10^4 (drag counts)", "Drag per NeuralFoil (lower is better)", ".1f"
+    else:
+        labels = ["at each airfoil's\nbest speed"]
+        vals_c = [cls_rows[0]["metric_nf"]]
+        vals_o = [opt_rows[0]["metric_nf"]]
+        name = "CL/CD" if mission == "range" else "CL^1.5/CD"
+        ylabel, title, fmt_spec = f"wing {name}", f"Wing {name} per NeuralFoil (higher is better)", ".1f"
+
+    # Add the change in % under each group (only where both airfoils have a value).
+    labels = [lab if (c is None or o is None) else f"{lab}\n{100 * (o / c - 1):+.1f} %"
+              for lab, c, o in zip(labels, vals_c, vals_o)]
+    x = np.arange(len(labels))
+    bw = 0.38
+    for k, (vals, color, lab) in enumerate(((vals_c, COLOR_CLASSIC, "classic"),
+                                           (vals_o, COLOR_OPT, "optimized"))):
+        for i, v in enumerate(vals):
+            if v is None:            # NeuralFoil found no operating point: draw no bar
+                continue
+            xi = x[i] + (k - 0.5) * bw
+            ax2.bar(xi, v, width=bw * 0.95, color=color, label=lab if i == 0 else None)
+            ax2.text(xi, v, format(v, fmt_spec), ha="center", va="bottom", fontsize=8)
+    ax2.set_xticks(x, labels, fontsize=8)
+    ax2.set_ylabel(ylabel, fontsize=9)
+    ax2.set_title(title, fontsize=10)
+    ax2.tick_params(axis="y", labelsize=8)
+    ax2.margins(y=0.15)
+    ax2.grid(alpha=0.3, axis="y")
+    ax2.legend(fontsize=8, frameon=False, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.28))
     return fig
 
 
@@ -122,7 +202,8 @@ with st.sidebar.form("inputs"):
     speed = st.number_input("Cruise speed (m/s) - used for cruise only", min_value=3.0,
                             max_value=60.0, value=DEFAULT_SPEED, step=0.5)
     t_min_pct = st.slider("Minimum thickness (% of chord)", min_value=5, max_value=15, value=8)
-    submitted = st.form_submit_button("Run design (~1-1.5 min)", type="primary")
+    submitted = st.form_submit_button("Run design", type="primary")
+    st.caption("Run time on the free server: cruise about 20 s, range/endurance about 2 min.")
 
 # For range/endurance the core still needs some speed in the drone dict, but it ignores it
 # (it searches over speeds itself). We pass the fixed default so the core's cache stays valid.
@@ -138,21 +219,40 @@ if submitted:
 
     # run() calls progress(message) at each stage. It does not report a percentage, so
     # we count stages: up to 2 attempts x (optimize + verify) = 4 stages.
+    # The 2nd attempt (stages 3-4) only runs if the gate rejects the 1st candidate.
     bar = st.progress(0.0, text="starting ...")
-    stage = {"n": 0}
+    status = st.empty()                 # one line of text, updated every second
+    stage = {"n": 0, "msg": "starting ..."}
 
     def on_progress(message):
+        # Called from the worker thread below. It only stores the text; the Streamlit
+        # elements are updated from the main script thread (Streamlit needs that).
         stage["n"] += 1
-        bar.progress(min(stage["n"] / 4, 0.95), text=f"Step {stage['n']}: {message}")
+        stage["msg"] = message
+
+    # Run the slow optimisation in a background thread, so this script can update the
+    # elapsed-time text once per second while it waits.
+    t_start = time.time()
+    pool = ThreadPoolExecutor(max_workers=1)
+    job = pool.submit(core.run, D, mission, t_min, effort="fast", progress=on_progress)
+    pool.shutdown(wait=False)           # no new jobs; the running one keeps going
+    while not job.done():
+        n = stage["n"]
+        bar.progress(min(n / 4, 0.95), text=f"Stage {n} of max. 4: {stage['msg']}")
+        status.caption(f"Running for {time.time() - t_start:.0f} s "
+                       f"(a {mission} run usually takes {RUN_TIME_TEXT[mission]} on the free server).")
+        wait([job], timeout=1.0)        # sleep up to 1 s, or less if the job finishes
 
     try:
-        result = core.run(D, mission, t_min, effort="fast", progress=on_progress)
+        result = job.result()           # gives the result, or re-raises the error from run()
     except ValueError as err:          # the core raises readable ValueErrors for infeasible drones
         bar.empty()
+        status.empty()
         st.session_state.pop("run", None)
         st.error(f"No design possible: {err}")
         st.stop()
     bar.progress(1.0, text="done")
+    status.caption(f"Finished in {time.time() - t_start:.0f} s.")
     # Keep the result across reruns (e.g. clicking the download button reruns the script).
     st.session_state["run"] = dict(result=result, D=D, mission=mission, t_min=t_min,
                                    inputs=dict(mass=mass, span=span, chord=chord, speed=speed))
@@ -188,8 +288,18 @@ else:
         for reason in ver["reasons"]:
             st.write(f"- {reason}")
 
-# --- plot
+# --- plots
 st.pyplot(plot_airfoils(result, core))
+if result["passed"]:
+    st.markdown("**What actually changed** (the shapes look alike, so here is the difference)")
+    st.pyplot(plot_difference(result, core, D, mission))
+    st.caption("Left: optimized minus classic surface height. Right: the NeuralFoil numbers "
+               "from the gate" + (" at the design speed and +/-20 %" if mission == "cruise" else
+                                  ", each airfoil at its own best speed")
+               + ". 2D NeuralFoil values, not wind-tunnel data.")
+else:
+    st.caption("No difference plot: the optimized candidate was rejected, so there is no "
+               "verified comparison to show. Its numbers are in 'Gate details' below, labelled as rejected.")
 
 # --- operating point
 st.subheader("Operating point (per NeuralFoil, final airfoil)")
