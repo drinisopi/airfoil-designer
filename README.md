@@ -26,6 +26,35 @@ streamlit run app.py
 
 `optimizer_state.pkl` and `mlp_weights.npz` must be next to `app.py`. numpy is pinned to 2.4.6 because the pickle was made with that version.
 
+## Speed and the free server
+
+Measured with a 2-CPU limit (like Streamlit Community Cloud's free tier), default drone, effort "fast":
+
+| Mission   | before | after |
+|-----------|--------|-------|
+| cruise    | 40 s   | 25 s  |
+| range     | 74 s   | 43 s  |
+| endurance | 70 s   | 43 s  |
+
+Two runs at the same time used to take about 150 s each (three: about 235 s each), and runs kept going
+after a visitor left. Now:
+
+- `app.py` sets the math libraries to 1 thread (top of the file). Results are bit-identical.
+- Only one design runs at a time; other visitors see "Another design is running, please wait" and start automatically afterwards.
+- A run stops within about a second if the visitor leaves or presses Run again, and is stopped after 5 minutes at most.
+- Each stage prints its time (lines starting with `[app]` / `[airfoil_core]`), visible under "Manage app" -> logs.
+
+## Example results
+
+"Show example result (precomputed)" in the sidebar shows the full result page for the default drone instantly.
+The numbers are in `example_results.json` (plain JSON), made with the real design code by:
+
+```bash
+python make_examples.py
+```
+
+Run it again whenever `airfoil_core.py`, the model files or the default drone change.
+
 ## Limitations (honest)
 
 - 2D section analysis only. Rectangular wing, section CL = wing CL, induced drag with Oswald e = 0.85 (range/endurance only).
@@ -37,4 +66,4 @@ streamlit run app.py
 
 ## TODO
 
-- Screenshots, example results, deployment notes, license.
+- Screenshots, deployment notes, license.

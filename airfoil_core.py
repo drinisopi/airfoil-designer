@@ -18,6 +18,7 @@ wing, section CL = wing CL, induced drag with Oswald e = 0.85 (only for range/en
 """
 import pickle
 import threading
+import time
 import warnings
 from math import comb
 
@@ -34,6 +35,15 @@ EFFORT = {                            # search effort presets
     "fast": dict(al=21, clg=12, maxiter=40, popsize=10),
     "full": dict(al=41, clg=25, maxiter=100, popsize=15),
 }
+
+class RunCancelled(Exception):
+    """Raised when a run is stopped early (visitor left, or the app's time limit was hit)."""
+
+
+def _log(msg):
+    """Timing line on stdout. On Streamlit Community Cloud it shows up under 'Manage app' -> logs."""
+    print(f"[airfoil_core] {msg}", flush=True)
+
 
 # ---------------------------------------------------------------- geometry (CST) ---------
 _x = (1 - np.cos(np.linspace(0, np.pi, 101))) / 2
@@ -280,18 +290,27 @@ class Core:
         return score
 
     # --- optimize + verify
-    def optimize(self, D, mission, t_min=0.08, cap=0.10, effort="fast", seed=0):
+    def optimize(self, D, mission, t_min=0.08, cap=0.10, effort="fast", seed=0, should_stop=None):
+        """should_stop: optional function returning True to stop early (raises RunCancelled).
+        It is only checked once per optimizer generation and never changes the search itself."""
         rd = self._reference(D, mission, t_min, effort)
         score = self._make_score(D, mission, t_min, cap, effort, rd)
         bi = rd["short"][0]
         if mission == "cruise":   # best classic under the full multi-point objective
             bi = int(min(rd["short"], key=lambda i: score(self.Z[i], guard=False)))
         e = EFFORT[effort]
+        # Only pass a callback when a stop check was given; the callback just asks
+        # "should I stop?" after each generation (True = stop) and does not touch the search.
+        extra = {}
+        if should_stop is not None:
+            extra["callback"] = lambda intermediate_result: bool(should_stop())
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             res = differential_evolution(score, list(zip(self.z_lo, self.z_hi)), maxiter=e["maxiter"],
                                          popsize=e["popsize"], seed=seed, tol=1e-8,
-                                         init="sobol", polish=False)
+                                         init="sobol", polish=False, **extra)
+        if should_stop is not None and should_stop():
+            raise RunCancelled("run stopped before the optimizer finished")
         return dict(z=res.x, bi=bi, value=float(res.fun), cap=cap,
                     density=self.density(res.x), thickness=thickness(self.z_to_w(res.x)[0]))
 
@@ -349,19 +368,40 @@ class Core:
             reasons.append("no NeuralFoil-verified improvement over the best classic airfoil")
         return dict(passed=not reasons, gain_pct=gain, rows=rows, reasons=reasons)
 
-    def run(self, D, mission, t_min=0.08, effort="fast", caps=(0.10, 0.07), progress=None):
-        """Optimize -> verify -> (retry with a stricter density cap) -> fall back to the classic."""
+    def run(self, D, mission, t_min=0.08, effort="fast", caps=(0.10, 0.07), progress=None,
+            should_stop=None):
+        """Optimize -> verify -> (retry with a stricter density cap) -> fall back to the classic.
+        should_stop: optional function; when it returns True the run ends with RunCancelled."""
+        def check():
+            if should_stop is not None and should_stop():
+                raise RunCancelled("run stopped")
+
+        t_run = time.perf_counter()
+        _log(f"{mission}: start (effort={effort})")
+        # Reference ("best classic") scan first, only to time it separately in the logs.
+        # The result is cached, so optimize() below reuses it: same numbers as before.
+        t = time.perf_counter()
+        self._reference(D, mission, t_min, effort)
+        _log(f"{mission}: reference-classic scan {time.perf_counter() - t:.1f} s")
         last = None
-        for cap in caps:
+        for attempt, cap in enumerate(caps, start=1):
+            check()
             if progress:
                 progress(f"optimizing (density cap {cap}) ...")
-            opt = self.optimize(D, mission, t_min, cap, effort)
+            t = time.perf_counter()
+            opt = self.optimize(D, mission, t_min, cap, effort, should_stop=should_stop)
+            _log(f"{mission}: attempt {attempt} optimization (cap {cap}) {time.perf_counter() - t:.1f} s")
+            check()
             if progress:
                 progress("verifying with NeuralFoil ...")
+            t = time.perf_counter()
             ver = self.verify(opt["z"], opt["bi"], D, mission)
+            _log(f"{mission}: attempt {attempt} NeuralFoil verification {time.perf_counter() - t:.1f} s "
+                 f"(gate {'passed' if ver['passed'] else 'failed'})")
             last = (opt, ver, cap)
             if ver["passed"]:
                 break
+        _log(f"{mission}: total {time.perf_counter() - t_run:.1f} s")
         opt, ver, cap = last
         z = opt["z"] if ver["passed"] else self.Z[opt["bi"]]
         w = self.z_to_w(z)[0]
