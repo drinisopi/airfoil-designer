@@ -11,6 +11,26 @@ All the engineering logic lives in airfoil_core.py. This file only:
   3. shows the result honestly (plot, gate verdict, operating point, .dat download),
   4. explains the machine learning behind the tool (second tab).
 """
+# --- Speed fix: use ONE thread per math library. ------------------------------------------
+# The free Streamlit server gives us about 2 CPUs, but numpy's math library (OpenBLAS) may see
+# all CPUs of the big host machine and start many threads that then fight over our 2 CPUs.
+# Measured with a 2-CPU limit: range took 74 s with the default threads and 43 s with 1 thread,
+# with bit-identical results. These lines MUST stay above every other import: the libraries
+# read these settings only once, when numpy is first loaded.
+import os
+import sys
+
+# Streamlit re-runs this file on every click, in the same process. Only the FIRST run matters
+# (numpy is loaded then and keeps these settings), so the check below only looks at that run.
+_first_run = os.environ.get("OPENBLAS_NUM_THREADS") != "1"
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ[_var] = "1"
+if _first_run and "numpy" in sys.modules:   # should not happen; if it does, we came too late
+    print("[app] WARNING: numpy was loaded before the thread settings; they may have no effect.",
+          flush=True)
+
+import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
@@ -19,12 +39,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 
-from airfoil_core import GATE_CONF, GATE_ERR, RE_MAX, RE_MIN, Core, _grid, drone_to_point, outline
+from airfoil_core import (GATE_CONF, GATE_ERR, RE_MAX, RE_MIN, Core, RunCancelled, _grid,
+                          drone_to_point, outline)
 
 # Files are looked up next to this script, so the app works no matter which
 # folder you start `streamlit run` from.
 HERE = Path(__file__).parent
 ASSETS = HERE / "assets"   # SHAP images for the "The ML behind it" tab
+EXAMPLES_FILE = HERE / "example_results.json"   # precomputed results (made by make_examples.py)
 
 # Default drone (the user can change all of these in the sidebar).
 DEFAULT_MASS = 2.0     # kg
@@ -32,8 +54,12 @@ DEFAULT_SPAN = 2.0     # m
 DEFAULT_CHORD = 0.2    # m
 DEFAULT_SPEED = 14.0   # m/s (only used for the cruise mission)
 
-# Typical run time on Streamlit Community Cloud (free tier), measured. Shown to the user.
-RUN_TIME_TEXT = {"cruise": "about 20 s", "range": "about 2 min", "endurance": "about 2 min"}
+# Typical run time on the free server with 2 CPUs (measured in a 2-CPU test, see README).
+RUN_TIME_TEXT = {"cruise": "about 20-30 s", "range": "about 45-60 s", "endurance": "about 45-60 s"}
+
+# Hard limit for one design run (seconds). After this the run is stopped and the visitor gets
+# a clear message. It also bounds how long anyone waits for the "one run at a time" lock.
+MAX_RUN_SECONDS = 300
 
 # Colors used in both plots (same meaning everywhere).
 COLOR_OPT = "#1f6fb4"      # optimized airfoil
@@ -52,6 +78,24 @@ def load_core():
     """Load the PCA basis + MLP weights once and share them between all users/reruns."""
     return Core(state_path=str(HERE / "optimizer_state.pkl"),
                 weights_path=str(HERE / "mlp_weights.npz"))
+
+
+@st.cache_resource
+def run_lock():
+    """ONE lock shared by every visitor (st.cache_resource makes it a single server-wide object).
+    Only one design runs at a time: two runs at once on 2 CPUs made both 3x slower in tests,
+    and abandoned runs piling up was what made range/endurance take many minutes."""
+    return threading.Lock()
+
+
+def load_examples():
+    """Precomputed results for the default drone, one per mission (see make_examples.py).
+    Plain JSON; the lists are turned back into numpy arrays where the page expects them."""
+    data = json.loads(EXAMPLES_FILE.read_text())
+    for run in data["runs"].values():
+        run["result"]["w"] = np.array(run["result"]["w"])
+        run["result"]["outline"] = np.array(run["result"]["outline"])
+    return data
 
 
 def classic_outline(core, name):
@@ -404,7 +448,17 @@ with st.sidebar.form("inputs"):
                             max_value=60.0, value=DEFAULT_SPEED, step=0.5)
     t_min_pct = st.slider("Minimum thickness (% of chord)", min_value=5, max_value=15, value=8)
     submitted = st.form_submit_button("Run design", type="primary")
-    st.caption("Run time on the free server: cruise about 20 s, range/endurance about 2 min.")
+    st.caption("Run time on the free server: cruise about 20-30 s, range/endurance about 45-60 s. "
+               "Only one design runs at a time; if someone else is running one, you wait in line.")
+
+# --- precomputed examples: show a full result page instantly, without running anything
+st.sidebar.divider()
+st.sidebar.subheader("Example")
+example_mission = st.sidebar.radio("Example mission", ["cruise", "range", "endurance"],
+                                   horizontal=True, key="example_mission")
+show_example = st.sidebar.button("Show example result (precomputed)")
+st.sidebar.caption(f"Default drone: {DEFAULT_MASS:g} kg, span {DEFAULT_SPAN:g} m, chord {DEFAULT_CHORD:g} m, "
+                   f"min. thickness 8 %, cruise speed {DEFAULT_SPEED:g} m/s. Computed in advance with this app's code.")
 
 # Two tabs: the design tool (first, the default) and the ML explanation.
 tab_tool, tab_ml = st.tabs(["Design tool", "The ML behind it"])
@@ -440,21 +494,77 @@ with tab_tool:
             stage["n"] += 1
             stage["msg"] = message
 
-        # Run the slow optimisation in a background thread, so this script can update the
-        # elapsed-time text once per second while it waits.
+        # --- 1) wait for our turn: only one design runs on the server at a time
+        lock = run_lock()
+        t_wait = time.time()
+        while not lock.acquire(blocking=False):
+            waited = time.time() - t_wait
+            if waited > MAX_RUN_SECONDS:
+                bar.empty()
+                status.empty()
+                st.error(f"The server stayed busy for more than {MAX_RUN_SECONDS / 60:g} minutes. "
+                         "Please try again later, or look at the precomputed example in the sidebar.")
+                st.stop()
+            bar.progress(0.0, text="Another design is running, please wait ...")
+            status.caption(f"Waiting for {waited:.0f} s. Your design starts automatically as soon "
+                           "as the other one is finished (only one design runs at a time).")
+            time.sleep(1.0)
+        # From here on WE hold the lock. The worker thread releases it when it ends (also on
+        # error or stop), so the next visitor can never overlap with a run that is still busy.
+
+        # --- 2) run the slow optimisation in a background thread, so this script can update
+        # the elapsed-time text once per second while it waits.
         t_start = time.time()
+        stop_flag = threading.Event()       # set = "please stop" (visitor left, or time limit)
+
+        def should_stop():
+            # Checked by the core about once per second. The time check is a second safety net
+            # in case nobody is left to set the flag.
+            return stop_flag.is_set() or time.time() - t_start > MAX_RUN_SECONDS
+
+        def worker():
+            try:
+                return core.run(D, mission, t_min, effort="fast", progress=on_progress,
+                                should_stop=should_stop)
+            except RunCancelled:
+                print(f"[app] {mission} run stopped after {time.time() - t_start:.1f} s", flush=True)
+                raise
+            finally:
+                lock.release()              # always free the server for the next design
+
+        print(f"[app] {mission} run started (waited {t_start - t_wait:.0f} s for the lock)", flush=True)
         pool = ThreadPoolExecutor(max_workers=1)
-        job = pool.submit(core.run, D, mission, t_min, effort="fast", progress=on_progress)
+        job = pool.submit(worker)
         pool.shutdown(wait=False)           # no new jobs; the running one keeps going
-        while not job.done():
-            n = stage["n"]
-            bar.progress(min(n / 4, 0.95), text=f"Stage {n} of max. 4: {stage['msg']}")
-            status.caption(f"Running for {time.time() - t_start:.0f} s "
-                           f"(a {mission} run usually takes {RUN_TIME_TEXT[mission]} on the free server).")
-            wait([job], timeout=1.0)        # sleep up to 1 s, or less if the job finishes
+        try:
+            while not job.done():
+                n = stage["n"]
+                bar.progress(min(n / 4, 0.95), text=f"Stage {n} of max. 4: {stage['msg']}")
+                status.caption(f"Running for {time.time() - t_start:.0f} s "
+                               f"(a {mission} run usually takes {RUN_TIME_TEXT[mission]} on the free server; "
+                               f"it is stopped after {MAX_RUN_SECONDS / 60:g} min).")
+                if time.time() - t_start > MAX_RUN_SECONDS:
+                    stop_flag.set()         # the worker stops at its next check
+                wait([job], timeout=1.0)    # sleep up to 1 s, or less if the job finishes
+        finally:
+            # If this script is interrupted (the visitor closed the page, or pressed Run again),
+            # Streamlit raises an exception inside the loop above. Without this line the old
+            # run would keep using the CPUs for nobody; now it stops within about a second.
+            if not job.done():
+                stop_flag.set()
+                print(f"[app] {mission} run abandoned by the visitor; stopping it", flush=True)
 
         try:
             result = job.result()           # gives the result, or re-raises the error from run()
+        except RunCancelled:
+            bar.empty()
+            status.empty()
+            st.session_state.pop("run", None)
+            print(f"[app] {mission} run stopped at the {MAX_RUN_SECONDS} s limit", flush=True)
+            st.error(f"The design was stopped because it took longer than {MAX_RUN_SECONDS / 60:g} minutes. "
+                     "The server may be busy; please try again later, or look at the precomputed "
+                     "example in the sidebar.")
+            st.stop()
         except ValueError as err:          # the core raises readable ValueErrors for infeasible drones
             bar.empty()
             status.empty()
@@ -463,9 +573,14 @@ with tab_tool:
             st.stop()
         bar.progress(1.0, text="done")
         status.caption(f"Finished in {time.time() - t_start:.0f} s.")
+        print(f"[app] {mission} run finished in {time.time() - t_start:.1f} s", flush=True)
         # Keep the result across reruns (e.g. clicking the download button reruns the script).
         st.session_state["run"] = dict(result=result, D=D, mission=mission, t_min=t_min,
                                        inputs=dict(mass=mass, span=span, chord=chord, speed=speed))
+
+    # --- precomputed example (instant, no calculation)
+    if show_example:
+        st.session_state["run"] = load_examples()["runs"][example_mission]
 
     if "run" not in st.session_state:
         st.info("Set your drone in the sidebar and press **Run design**.")
@@ -479,6 +594,12 @@ with tab_tool:
     inp = run["inputs"]
 
     st.subheader(f"Result - {mission} mission")
+    if run.get("example"):
+        st.info("**Precomputed example for the default drone** "
+                f"({inp['mass']:g} kg, span {inp['span']:g} m, chord {inp['chord']:g} m, min. thickness 8 %"
+                + (f", speed {inp['speed']:g} m/s" if mission == "cruise" else "") + "). "
+                f"It was computed in advance with this app's code ({run['generated']}), so it shows instantly. "
+                "To design for your own drone, set it in the sidebar and press **Run design**.")
     st.caption(f"Inputs: {inp['mass']} kg, span {inp['span']} m, chord {inp['chord']} m, "
                f"min. thickness {t_min:.0%}" + (f", speed {inp['speed']} m/s" if mission == "cruise" else ""))
 
